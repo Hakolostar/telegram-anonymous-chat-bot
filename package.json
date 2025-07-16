@@ -1,0 +1,37 @@
+{
+  "name": "telegram-anonymous-chat-bot",
+  "version": "1.0.0",
+  "description": "Anonymous chat bot that matches strangers based on profile similarity",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "setup": "node setup.js",
+    "test": "node test.js"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "anonymous",
+    "chat",
+    "matching",
+    "strangers"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "mongodb": "^6.3.0",
+    "redis": "^4.6.12",
+    "dotenv": "^16.3.1",
+    "joi": "^17.11.0",
+    "moment": "^2.29.4",
+    "bad-words": "^3.0.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
