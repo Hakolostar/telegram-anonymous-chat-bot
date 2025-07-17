@@ -62,7 +62,7 @@ const profileSchema = Joi.object({
     userId: Joi.number().required(),
     username: Joi.string().allow(''),
     firstName: Joi.string().required(),
-    age: Joi.number().min(13).max(100).required(),
+    age: Joi.number().min(18).max(100).required(), // Updated minimum age to 18
     gender: Joi.string().valid(...GENDERS).required(),
     education: Joi.string().valid(...EDUCATION_LEVELS).required(),
     interests: Joi.array().items(Joi.string()).min(1).max(10).required(),
@@ -71,8 +71,21 @@ const profileSchema = Joi.object({
     createdAt: Joi.date().default(Date.now),
     lastActive: Joi.date().default(Date.now),
     isActive: Joi.boolean().default(true),
-    isBanned: Joi.boolean().default(false)
-}).unknown(true); // Allow unknown fields (for MongoDB metadata)
+    isBanned: Joi.boolean().default(false),
+    bannedAt: Joi.date().optional(), // Allow banned date
+    banReason: Joi.string().optional(), // Allow ban reason
+    bannedBy: Joi.number().optional(), // Allow banned by admin ID
+    unbannedAt: Joi.date().optional(), // Allow unban date
+    unbannedBy: Joi.number().optional(), // Allow unbanned by admin ID
+    lastBanReason: Joi.string().optional(), // Allow previous ban reason history
+    lastBannedAt: Joi.date().optional(), // Allow previous ban date history
+    appealText: Joi.string().optional(), // Appeal message
+    appealedAt: Joi.date().optional(), // When appeal was submitted
+    appealStatus: Joi.string().valid('pending', 'approved', 'denied').optional(), // Appeal status
+    appealReviewedBy: Joi.number().optional(), // Admin who reviewed appeal
+    appealReviewedAt: Joi.date().optional(), // When appeal was reviewed
+    appealDenyReason: Joi.string().optional() // Reason for appeal denial
+});
 
 // Utility function to safely edit messages
 async function safeEditMessage(ctx, messageId, text, extra = {}) {
@@ -143,17 +156,10 @@ class DatabaseOperations {
     // User operations
     static async saveUser(userProfile) {
         try {
-            // Create a clean profile object without MongoDB-specific fields for validation
-            const cleanProfile = { ...userProfile };
-            if (cleanProfile._id) {
-                delete cleanProfile._id;
-            }
-            
-            const { error, value } = profileSchema.validate(cleanProfile);
+            const { error, value } = profileSchema.validate(userProfile);
             if (error) throw new Error(`Validation error: ${error.details[0].message}`);
 
             if (db) {
-                // For MongoDB, use the clean validated profile without _id
                 await db.collection('users').replaceOne(
                     { userId: value.userId },
                     value,
@@ -185,6 +191,31 @@ class DatabaseOperations {
         } catch (error) {
             console.error('Error getting user:', error);
             return null;
+        }
+    }
+
+    static async updateUser(userId, updateData) {
+        try {
+            if (db) {
+                await db.collection('users').updateOne(
+                    { userId },
+                    { $set: updateData }
+                );
+            } else if (redisClient) {
+                const userData = await this.getUser(userId);
+                if (userData) {
+                    const updatedUser = { ...userData, ...updateData };
+                    await redisClient.set(`user:${userId}`, JSON.stringify(updatedUser));
+                }
+            } else {
+                const userData = memoryUsers.get(userId);
+                if (userData) {
+                    memoryUsers.set(userId, { ...userData, ...updateData });
+                }
+            }
+        } catch (error) {
+            console.error('Error updating user:', error);
+            throw error;
         }
     }
 
@@ -788,6 +819,27 @@ function createMainMenuKeyboard() {
     ]).resize().persistent();
 }
 
+// Function to show main menu
+async function showMainMenu(ctx) {
+    const user = await DatabaseOperations.getUser(ctx.from.id);
+    if (!user) {
+        await ctx.reply('❌ You need to create a profile first. Use /start to begin!');
+        return;
+    }
+    
+    await ctx.reply(
+        '🏠 **Main Menu**\n\n' +
+        '🔍 Find Match - Connect with someone new\n' +
+        '👤 My Profile - View or edit your profile\n' +
+        '❓ Help - Get assistance\n' +
+        '📊 Menu - Show this menu',
+        {
+            parse_mode: 'Markdown',
+            ...createMainMenuKeyboard()
+        }
+    );
+}
+
 function createChatKeyboard() {
     return Markup.keyboard([
         ['🚪 End Chat'],
@@ -868,365 +920,8 @@ function createInterestsKeyboard(selectedInterests = []) {
 const profileSetupScene = new Scenes.BaseScene('PROFILE_SETUP');
 profileSetupScene.enter(async (ctx) => {
     ctx.session.profileData = ctx.session.profileData || {};
-    await ctx.reply('👋 Welcome! Let\'s set up your profile.\n\n🎂 Please enter your age (13-100):');
+    await ctx.reply('👋 Welcome! Let\'s set up your profile.\n\n🎂 Please enter your age (18-100):');
 });
-
-// Scene for editing existing profile
-const editProfileScene = new Scenes.BaseScene('EDIT_PROFILE');
-editProfileScene.enter(async (ctx) => {
-    const user = await DatabaseOperations.getUser(ctx.from.id);
-    if (!user) {
-        await ctx.reply('❌ You need to create a profile first. Use /start to begin!');
-        return ctx.scene.leave();
-    }
-    
-    // Initialize with current user data
-    ctx.session.profileData = {
-        age: user.age,
-        gender: user.gender,
-        education: user.education,
-        language: Array.isArray(user.language) ? [...user.language] : [user.language],
-        interests: [...user.interests],
-        preferredGender: user.preferredGender
-    };
-    
-    await ctx.reply(
-        '✏️ **Edit Your Profile**\n\n' +
-        'What would you like to update?',
-        {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('🎂 Age', 'edit_age')],
-                [Markup.button.callback('👤 Gender', 'edit_gender')],
-                [Markup.button.callback('🎓 Education', 'edit_education')],
-                [Markup.button.callback('🌍 Languages', 'edit_languages')],
-                [Markup.button.callback('🎯 Interests', 'edit_interests')],
-                [Markup.button.callback('💕 Preference', 'edit_preference')],
-                [Markup.button.callback('💾 Save Changes', 'save_profile')],
-                [Markup.button.callback('❌ Cancel', 'cancel_edit')]
-            ])
-        }
-    );
-});
-
-editProfileScene.action('edit_age', async (ctx) => {
-    await ctx.answerCbQuery();
-    ctx.session.editingField = 'age';
-    await ctx.editMessageText(
-        `🎂 **Current Age:** ${ctx.session.profileData.age}\n\n` +
-        'Please enter your new age (13-100):'
-    );
-});
-
-editProfileScene.action('edit_gender', async (ctx) => {
-    await ctx.answerCbQuery();
-    await ctx.editMessageText(
-        `👤 **Current Gender:** ${ctx.session.profileData.gender}\n\n` +
-        'Select your gender:',
-        Markup.inlineKeyboard([
-            [Markup.button.callback('👨 Male', 'set_gender_Male')],
-            [Markup.button.callback('👩 Female', 'set_gender_Female')],
-            [Markup.button.callback('🔙 Back', 'back_to_menu')]
-        ])
-    );
-});
-
-editProfileScene.action('edit_education', async (ctx) => {
-    await ctx.answerCbQuery();
-    await ctx.editMessageText(
-        `🎓 **Current Education:** ${ctx.session.profileData.education}\n\n` +
-        'Select your education level:',
-        Markup.inlineKeyboard([
-            [Markup.button.callback('🏫 High School', 'set_edu_High School')],
-            [Markup.button.callback('🎓 Bachelor', 'set_edu_Bachelor')],
-            [Markup.button.callback('📚 Master', 'set_edu_Master')],
-            [Markup.button.callback('🔬 PhD', 'set_edu_PhD')],
-            [Markup.button.callback('📖 Other', 'set_edu_Other')],
-            [Markup.button.callback('🔙 Back', 'back_to_menu')]
-        ])
-    );
-});
-
-editProfileScene.action('edit_languages', async (ctx) => {
-    await ctx.answerCbQuery();
-    await ctx.editMessageText(
-        `🌍 **Current Languages:** ${ctx.session.profileData.language.join(', ')}\n\n` +
-        'Select your languages (multiple selection):',
-        createLanguageKeyboard(ctx.session.profileData.language)
-    );
-});
-
-editProfileScene.action('edit_interests', async (ctx) => {
-    await ctx.answerCbQuery();
-    await ctx.editMessageText(
-        `🎯 **Current Interests:** ${ctx.session.profileData.interests.join(', ')}\n\n` +
-        'Select your interests (multiple selection):',
-        createInterestsKeyboard(ctx.session.profileData.interests)
-    );
-});
-
-editProfileScene.action('edit_preference', async (ctx) => {
-    await ctx.answerCbQuery();
-    await ctx.editMessageText(
-        `💕 **Current Preference:** ${ctx.session.profileData.preferredGender}\n\n` +
-        'Who would you like to chat with?',
-        Markup.inlineKeyboard([
-            [Markup.button.callback('👥 Anyone', 'set_pref_Any')],
-            [Markup.button.callback('👨 Male only', 'set_pref_Male only')],
-            [Markup.button.callback('👩 Female only', 'set_pref_Female only')],
-            [Markup.button.callback('🔙 Back', 'back_to_menu')]
-        ])
-    );
-});
-
-// Gender selection handlers
-editProfileScene.action(/set_gender_(.+)/, async (ctx) => {
-    const gender = ctx.match[1];
-    ctx.session.profileData.gender = gender;
-    await ctx.answerCbQuery('✅ Gender updated!');
-    await showEditMenu(ctx);
-});
-
-// Education selection handlers
-editProfileScene.action(/set_edu_(.+)/, async (ctx) => {
-    const education = ctx.match[1];
-    ctx.session.profileData.education = education;
-    await ctx.answerCbQuery('✅ Education updated!');
-    await showEditMenu(ctx);
-});
-
-// Preference selection handlers
-editProfileScene.action(/set_pref_(.+)/, async (ctx) => {
-    const preference = ctx.match[1];
-    ctx.session.profileData.preferredGender = preference;
-    await ctx.answerCbQuery('✅ Preference updated!');
-    await showEditMenu(ctx);
-});
-
-// Language selection handlers (reuse from profile setup)
-editProfileScene.action(/lang_(.+)/, async (ctx) => {
-    const language = ctx.match[1];
-    const { profileData } = ctx.session;
-    
-    if (!profileData.language) profileData.language = [];
-    
-    const originalLanguages = [...profileData.language];
-    
-    if (profileData.language.includes(language)) {
-        profileData.language = profileData.language.filter(l => l !== language);
-    } else if (profileData.language.length < 5) {
-        profileData.language.push(language);
-    } else {
-        await ctx.answerCbQuery('You can select up to 5 languages maximum');
-        return;
-    }
-    
-    // Only edit the message if languages actually changed
-    if (JSON.stringify(originalLanguages.sort()) !== JSON.stringify(profileData.language.sort())) {
-        try {
-            await ctx.editMessageReplyMarkup(createLanguageKeyboard(profileData.language).reply_markup);
-        } catch (error) {
-            if (error.description && error.description.includes('message is not modified')) {
-                console.log('Message edit skipped - content unchanged');
-            } else {
-                console.error('Error editing message:', error);
-            }
-        }
-    }
-    
-    await ctx.answerCbQuery();
-});
-
-editProfileScene.action('languages_done', async (ctx) => {
-    const { profileData } = ctx.session;
-    
-    if (!profileData.language || profileData.language.length === 0) {
-        await ctx.answerCbQuery('❌ Please select at least one language');
-        return;
-    }
-    
-    await ctx.answerCbQuery('✅ Languages updated!');
-    await showEditMenu(ctx);
-});
-
-// Interest selection handlers (reuse from profile setup)
-editProfileScene.action(/interest_(.+)/, async (ctx) => {
-    const interest = ctx.match[1];
-    const { profileData } = ctx.session;
-    
-    if (!profileData.interests) profileData.interests = [];
-    
-    const originalInterests = [...profileData.interests];
-    
-    if (profileData.interests.includes(interest)) {
-        profileData.interests = profileData.interests.filter(i => i !== interest);
-    } else if (profileData.interests.length < 10) {
-        profileData.interests.push(interest);
-    } else {
-        await ctx.answerCbQuery('You can select up to 10 interests maximum');
-        return;
-    }
-    
-    // Only edit the message if interests actually changed
-    if (JSON.stringify(originalInterests.sort()) !== JSON.stringify(profileData.interests.sort())) {
-        try {
-            await ctx.editMessageReplyMarkup(createInterestsKeyboard(profileData.interests).reply_markup);
-        } catch (error) {
-            if (error.description && error.description.includes('message is not modified')) {
-                console.log('Message edit skipped - content unchanged');
-            } else {
-                console.error('Error editing message:', error);
-            }
-        }
-    }
-    
-    await ctx.answerCbQuery();
-});
-
-editProfileScene.action('interests_done', async (ctx) => {
-    const { profileData } = ctx.session;
-    
-    if (!profileData.interests || profileData.interests.length === 0) {
-        await ctx.answerCbQuery('❌ Please select at least one interest');
-        return;
-    }
-    
-    await ctx.answerCbQuery('✅ Interests updated!');
-    await showEditMenu(ctx);
-});
-
-// Back to menu handler
-editProfileScene.action('back_to_menu', async (ctx) => {
-    await ctx.answerCbQuery();
-    await showEditMenu(ctx);
-});
-
-// Save profile handler
-editProfileScene.action('save_profile', async (ctx) => {
-    try {
-        await ctx.answerCbQuery();
-        
-        const { profileData } = ctx.session;
-        const currentUser = await DatabaseOperations.getUser(ctx.from.id);
-        
-        // Merge updated data with existing user data, excluding MongoDB _id
-        const updatedProfile = {
-            userId: currentUser.userId,
-            username: currentUser.username,
-            firstName: currentUser.firstName,
-            createdAt: currentUser.createdAt,
-            isActive: currentUser.isActive,
-            isBanned: currentUser.isBanned,
-            ...profileData,
-            lastActive: new Date()
-        };
-        
-        await DatabaseOperations.saveUser(updatedProfile);
-        
-        await ctx.editMessageText(
-            '✅ **Profile updated successfully!**\n\n' +
-            '🎉 Your changes have been saved!\n' +
-            '🔍 You can now find matches with your updated profile.',
-            { parse_mode: 'Markdown' }
-        );
-        
-        // Send main menu keyboard in a new message
-        await ctx.reply(
-            '🏠 **Main Menu**\n\n' +
-            '👋 What would you like to do next?',
-            {
-                parse_mode: 'Markdown',
-                ...createMainMenuKeyboard()
-            }
-        );
-        
-        ctx.session.profileData = null;
-        ctx.session.editingField = null;
-        return ctx.scene.leave();
-    } catch (error) {
-        console.error('Error saving profile:', error);
-        await ctx.editMessageText('❌ Error saving profile. Please try again.');
-    }
-});
-
-// Cancel edit handler
-editProfileScene.action('cancel_edit', async (ctx) => {
-    await ctx.answerCbQuery();
-    await ctx.editMessageText(
-        '❌ **Profile editing cancelled**\n\n' +
-        'No changes were made to your profile.',
-        { parse_mode: 'Markdown' }
-    );
-    
-    // Send main menu keyboard in a new message
-    await ctx.reply(
-        '🏠 **Main Menu**\n\n' +
-        '👋 What would you like to do?',
-        {
-            parse_mode: 'Markdown',
-            ...createMainMenuKeyboard()
-        }
-    );
-    
-    ctx.session.profileData = null;
-    ctx.session.editingField = null;
-    return ctx.scene.leave();
-});
-
-// Handle text input for age editing
-editProfileScene.on('text', async (ctx) => {
-    const { editingField, profileData } = ctx.session;
-    const text = ctx.message.text;
-
-    try {
-        if (editingField === 'age') {
-            const age = parseInt(text);
-            if (age >= 13 && age <= 100) {
-                profileData.age = age;
-                ctx.session.editingField = null;
-                
-                await ctx.reply('✅ Age updated!');
-                await showEditMenu(ctx);
-            } else {
-                await ctx.reply('❌ Please enter a valid age between 13 and 100:');
-            }
-        } else {
-            await ctx.reply('❓ Please use the buttons to navigate or edit your profile.');
-        }
-    } catch (error) {
-        console.error('Profile edit error:', error);
-        await ctx.reply('❌ Something went wrong. Please try again.');
-    }
-});
-
-// Helper function to show edit menu
-async function showEditMenu(ctx) {
-    const { profileData } = ctx.session;
-    
-    const menuText = 
-        '✏️ **Edit Your Profile**\n\n' +
-        `🎂 Age: ${profileData.age}\n` +
-        `👤 Gender: ${profileData.gender}\n` +
-        `🎓 Education: ${profileData.education}\n` +
-        `🌍 Languages: ${profileData.language.join(', ')}\n` +
-        `🎯 Interests: ${profileData.interests.slice(0, 3).join(', ')}${profileData.interests.length > 3 ? '...' : ''}\n` +
-        `💕 Looking for: ${profileData.preferredGender}\n\n` +
-        'What would you like to update?';
-    
-    await ctx.editMessageText(menuText, {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-            [Markup.button.callback('🎂 Age', 'edit_age')],
-            [Markup.button.callback('👤 Gender', 'edit_gender')],
-            [Markup.button.callback('🎓 Education', 'edit_education')],
-            [Markup.button.callback('🌍 Languages', 'edit_languages')],
-            [Markup.button.callback('🎯 Interests', 'edit_interests')],
-            [Markup.button.callback('💕 Preference', 'edit_preference')],
-            [Markup.button.callback('💾 Save Changes', 'save_profile')],
-            [Markup.button.callback('❌ Cancel', 'cancel_edit')]
-        ])
-    });
-}
 
 profileSetupScene.on('text', async (ctx) => {
     const { profileData } = ctx.session;
@@ -1235,7 +930,7 @@ profileSetupScene.on('text', async (ctx) => {
     try {
         if (!profileData.age) {
             const age = parseInt(text);
-            if (age >= 13 && age <= 100) {
+            if (age >= 18 && age <= 100) {
                 profileData.age = age;
                 await ctx.reply('👤 What\'s your gender?', 
                     Markup.inlineKeyboard([
@@ -1244,7 +939,7 @@ profileSetupScene.on('text', async (ctx) => {
                     ])
                 );
             } else {
-                await ctx.reply('❌ Please enter a valid age between 13 and 100:');
+                await ctx.reply('❌ Please enter a valid age between 18 and 100:');
             }
         } else if (!profileData.language && profileData.gender && profileData.education) {
             // Handle language selection after education
@@ -1329,7 +1024,7 @@ profileSetupScene.action('languages_done', async (ctx) => {
     }
     
     await ctx.editMessageText('🎯 Great! Now select your interests (choose multiple):', 
-        createInterestsKeyboard(profileData.interests || [])
+        this.createInterestsKeyboard(profileData.interests || [])
     );
 });
 
@@ -1426,7 +1121,380 @@ profileSetupScene.action(/pref_(.+)/, async (ctx) => {
     }
 });
 
-// Create stage and register scenes
+// Create stage and register scene
+const editProfileScene = new Scenes.BaseScene('EDIT_PROFILE');
+
+editProfileScene.enter(async (ctx) => {
+    try {
+        const user = await DatabaseOperations.getUser(ctx.from.id);
+        if (!user) {
+            await ctx.reply('❌ Profile not found. Please create a profile first.');
+            return ctx.scene.leave();
+        }
+        
+        ctx.session.currentUser = user;
+        await ctx.reply(
+            '✏️ **Edit Your Profile**\n\n' +
+            'Select what you\'d like to update:',
+            {
+                parse_mode: 'Markdown',
+                ...Markup.inlineKeyboard([
+                    [Markup.button.callback('🎂 Age', 'edit_age')],
+                    [Markup.button.callback('👤 Gender', 'edit_gender')],
+                    [Markup.button.callback('🎓 Education', 'edit_education')],
+                    [Markup.button.callback('🌍 Languages', 'edit_languages')],
+                    [Markup.button.callback('🎯 Interests', 'edit_interests')],
+                    [Markup.button.callback('💕 Preference', 'edit_preference')],
+                    [Markup.button.callback('❌ Cancel', 'edit_cancel')]
+                ])
+            }
+        );
+    } catch (error) {
+        console.error('Error entering edit profile:', error);
+        await ctx.reply('❌ An error occurred. Please try again.');
+        return ctx.scene.leave();
+    }
+});
+
+// Edit Age
+editProfileScene.action('edit_age', async (ctx) => {
+    ctx.session.editField = 'age';
+    try {
+        await ctx.editMessageText(
+            '🎂 Please enter your new age (18-100):\n\n' +
+            '💡 Just type your age number and send it.',
+            Markup.inlineKeyboard([
+                [Markup.button.callback('⬅️ Back', 'back_to_menu')]
+            ])
+        );
+    } catch (editError) {
+        // If editing fails, send a new message
+        await ctx.reply(
+            '🎂 Please enter your new age (18-100):\n\n' +
+            '💡 Just type your age number and send it.',
+            Markup.inlineKeyboard([
+                [Markup.button.callback('⬅️ Back', 'back_to_menu')]
+            ])
+        );
+    }
+});
+
+// Edit Gender
+editProfileScene.action('edit_gender', async (ctx) => {
+    try {
+        await ctx.editMessageText('👤 Select your gender:', 
+            Markup.inlineKeyboard([
+                [Markup.button.callback('👨 Male', 'set_gender_Male')],
+                [Markup.button.callback('👩 Female', 'set_gender_Female')],
+                [Markup.button.callback('⬅️ Back', 'back_to_menu')]
+            ])
+        );
+    } catch (editError) {
+        await ctx.reply('👤 Select your gender:', 
+            Markup.inlineKeyboard([
+                [Markup.button.callback('👨 Male', 'set_gender_Male')],
+                [Markup.button.callback('👩 Female', 'set_gender_Female')],
+                [Markup.button.callback('⬅️ Back', 'back_to_menu')]
+            ])
+        );
+    }
+});
+
+// Edit Education
+editProfileScene.action('edit_education', async (ctx) => {
+    try {
+        await ctx.editMessageText('🎓 Select your education level:', 
+            Markup.inlineKeyboard([
+                [Markup.button.callback('🏫 High School', 'set_edu_High School')],
+                [Markup.button.callback('🎓 Bachelor', 'set_edu_Bachelor')],
+                [Markup.button.callback('📚 Master', 'set_edu_Master')],
+                [Markup.button.callback('🔬 PhD', 'set_edu_PhD')],
+                [Markup.button.callback('📖 Other', 'set_edu_Other')],
+                [Markup.button.callback('⬅️ Back', 'back_to_menu')]
+            ])
+        );
+    } catch (editError) {
+        await ctx.reply('🎓 Select your education level:', 
+            Markup.inlineKeyboard([
+                [Markup.button.callback('🏫 High School', 'set_edu_High School')],
+                [Markup.button.callback('🎓 Bachelor', 'set_edu_Bachelor')],
+                [Markup.button.callback('📚 Master', 'set_edu_Master')],
+                [Markup.button.callback('🔬 PhD', 'set_edu_PhD')],
+                [Markup.button.callback('📖 Other', 'set_edu_Other')],
+                [Markup.button.callback('⬅️ Back', 'back_to_menu')]
+            ])
+        );
+    }
+});
+
+// Edit Languages
+editProfileScene.action('edit_languages', async (ctx) => {
+    const currentLanguages = ctx.session.currentUser.language || [];
+    ctx.session.editField = 'languages';
+    try {
+        await ctx.editMessageText('🌍 Select your languages (current selection will be updated):', 
+            createLanguageKeyboard(currentLanguages)
+        );
+    } catch (editError) {
+        await ctx.reply('🌍 Select your languages (current selection will be updated):', 
+            createLanguageKeyboard(currentLanguages)
+        );
+    }
+});
+
+// Edit Interests
+editProfileScene.action('edit_interests', async (ctx) => {
+    const currentInterests = ctx.session.currentUser.interests || [];
+    ctx.session.editField = 'interests';
+    try {
+        await ctx.editMessageText('🎯 Select your interests (current selection will be updated):', 
+            createInterestsKeyboard(currentInterests)
+        );
+    } catch (editError) {
+        await ctx.reply('🎯 Select your interests (current selection will be updated):', 
+            createInterestsKeyboard(currentInterests)
+        );
+    }
+});
+
+// Edit Preference
+editProfileScene.action('edit_preference', async (ctx) => {
+    try {
+        await ctx.editMessageText('💕 Who would you like to chat with?', 
+            Markup.inlineKeyboard([
+                [Markup.button.callback('👥 Anyone', 'set_pref_Any')],
+                [Markup.button.callback('👨 Male only', 'set_pref_Male only')],
+                [Markup.button.callback('👩 Female only', 'set_pref_Female only')],
+                [Markup.button.callback('⬅️ Back', 'back_to_menu')]
+            ])
+        );
+    } catch (editError) {
+        await ctx.reply('💕 Who would you like to chat with?', 
+            Markup.inlineKeyboard([
+                [Markup.button.callback('👥 Anyone', 'set_pref_Any')],
+                [Markup.button.callback('👨 Male only', 'set_pref_Male only')],
+                [Markup.button.callback('👩 Female only', 'set_pref_Female only')],
+                [Markup.button.callback('⬅️ Back', 'back_to_menu')]
+            ])
+        );
+    }
+});
+
+// Handle text input for age
+editProfileScene.on('text', async (ctx) => {
+    if (ctx.session.editField === 'age') {
+        const age = parseInt(ctx.message.text);
+        if (age >= 18 && age <= 100) {
+            await updateUserField(ctx, 'age', age);
+        } else {
+            await ctx.reply('❌ Please enter a valid age between 18 and 100:');
+        }
+    }
+});
+
+// Handle gender selection
+editProfileScene.action(/set_gender_(.+)/, async (ctx) => {
+    const gender = ctx.match[1];
+    await updateUserField(ctx, 'gender', gender);
+});
+
+// Handle education selection
+editProfileScene.action(/set_edu_(.+)/, async (ctx) => {
+    const education = ctx.match[1];
+    await updateUserField(ctx, 'education', education);
+});
+
+// Handle preference selection
+editProfileScene.action(/set_pref_(.+)/, async (ctx) => {
+    const preference = ctx.match[1];
+    await updateUserField(ctx, 'preferredGender', preference);
+});
+
+// Handle language selection (reuse from profile setup)
+editProfileScene.action(/lang_(.+)/, async (ctx) => {
+    if (ctx.session.editField !== 'languages') return;
+    
+    const language = ctx.match[1];
+    const currentLanguages = ctx.session.currentUser.language || [];
+    
+    let updatedLanguages = [...currentLanguages];
+    
+    if (updatedLanguages.includes(language)) {
+        updatedLanguages = updatedLanguages.filter(l => l !== language);
+    } else if (updatedLanguages.length < 5) {
+        updatedLanguages.push(language);
+    } else {
+        await ctx.answerCbQuery('You can select up to 5 languages maximum');
+        return;
+    }
+    
+    ctx.session.currentUser.language = updatedLanguages;
+    
+    try {
+        await ctx.editMessageReplyMarkup(createLanguageKeyboard(updatedLanguages).reply_markup);
+    } catch (error) {
+        if (!error.description?.includes('message is not modified')) {
+            console.error('Error editing message:', error);
+        }
+    }
+    
+    await ctx.answerCbQuery();
+});
+
+editProfileScene.action('languages_done', async (ctx) => {
+    if (ctx.session.editField !== 'languages') return;
+    
+    const languages = ctx.session.currentUser.language || [];
+    if (languages.length === 0) {
+        await ctx.answerCbQuery('❌ Please select at least one language');
+        return;
+    }
+    
+    await updateUserField(ctx, 'language', languages);
+});
+
+// Handle interest selection (reuse from profile setup)
+editProfileScene.action(/interest_(.+)/, async (ctx) => {
+    if (ctx.session.editField !== 'interests') return;
+    
+    const interest = ctx.match[1];
+    const currentInterests = ctx.session.currentUser.interests || [];
+    
+    let updatedInterests = [...currentInterests];
+    
+    if (updatedInterests.includes(interest)) {
+        updatedInterests = updatedInterests.filter(i => i !== interest);
+    } else if (updatedInterests.length < 10) {
+        updatedInterests.push(interest);
+    } else {
+        await ctx.answerCbQuery('You can select up to 10 interests maximum');
+        return;
+    }
+    
+    ctx.session.currentUser.interests = updatedInterests;
+    
+    try {
+        await ctx.editMessageReplyMarkup(createInterestsKeyboard(updatedInterests).reply_markup);
+    } catch (error) {
+        if (!error.description?.includes('message is not modified')) {
+            console.error('Error editing message:', error);
+        }
+    }
+    
+    await ctx.answerCbQuery();
+});
+
+editProfileScene.action('interests_done', async (ctx) => {
+    if (ctx.session.editField !== 'interests') return;
+    
+    const interests = ctx.session.currentUser.interests || [];
+    if (interests.length === 0) {
+        await ctx.answerCbQuery('❌ Please select at least one interest');
+        return;
+    }
+    
+    await updateUserField(ctx, 'interests', interests);
+});
+
+// Back to edit menu
+editProfileScene.action('back_to_menu', async (ctx) => {
+    ctx.session.editField = null;
+    try {
+        await ctx.editMessageText(
+            '✏️ **Edit Your Profile**\n\n' +
+            'Select what you\'d like to update:',
+            {
+                parse_mode: 'Markdown',
+                ...Markup.inlineKeyboard([
+                    [Markup.button.callback('🎂 Age', 'edit_age')],
+                    [Markup.button.callback('👤 Gender', 'edit_gender')],
+                    [Markup.button.callback('🎓 Education', 'edit_education')],
+                    [Markup.button.callback('🌍 Languages', 'edit_languages')],
+                    [Markup.button.callback('🎯 Interests', 'edit_interests')],
+                    [Markup.button.callback('💕 Preference', 'edit_preference')],
+                    [Markup.button.callback('❌ Cancel', 'edit_cancel')]
+                ])
+            }
+        );
+    } catch (editError) {
+        await ctx.reply(
+            '✏️ **Edit Your Profile**\n\n' +
+            'Select what you\'d like to update:',
+            {
+                parse_mode: 'Markdown',
+                ...Markup.inlineKeyboard([
+                    [Markup.button.callback('🎂 Age', 'edit_age')],
+                    [Markup.button.callback('👤 Gender', 'edit_gender')],
+                    [Markup.button.callback('🎓 Education', 'edit_education')],
+                    [Markup.button.callback('🌍 Languages', 'edit_languages')],
+                    [Markup.button.callback('🎯 Interests', 'edit_interests')],
+                    [Markup.button.callback('💕 Preference', 'edit_preference')],
+                    [Markup.button.callback('❌ Cancel', 'edit_cancel')]
+                ])
+            }
+        );
+    }
+});
+
+// Cancel editing
+editProfileScene.action('edit_cancel', async (ctx) => {
+    await ctx.editMessageText('❌ Edit cancelled.');
+    setTimeout(async () => {
+        await showMainMenu(ctx);
+    }, 1000);
+    return ctx.scene.leave();
+});
+
+// Go to main menu after successful update
+editProfileScene.action('goto_main_menu', async (ctx) => {
+    try {
+        await ctx.editMessageText('✅ Profile updated successfully!');
+    } catch (editError) {
+        // If editing fails, just leave the scene
+    }
+    setTimeout(async () => {
+        await showMainMenu(ctx);
+    }, 500);
+    return ctx.scene.leave();
+});
+
+// Helper function to update user field
+async function updateUserField(ctx, field, value) {
+    try {
+        const updateData = { [field]: value };
+        await DatabaseOperations.updateUser(ctx.from.id, updateData);
+        
+        let fieldName = field;
+        if (field === 'preferredGender') fieldName = 'chat preference';
+        
+        // Try to edit the message first, if it fails, send a new message
+        try {
+            await ctx.editMessageText(
+                `✅ ${fieldName.charAt(0).toUpperCase() + fieldName.slice(1)} updated successfully!`,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('✏️ Edit Another Field', 'back_to_menu')],
+                    [Markup.button.callback('🏠 Main Menu', 'goto_main_menu')]
+                ])
+            );
+        } catch (editError) {
+            // If editing fails, send a new message
+            await ctx.reply(
+                `✅ ${fieldName.charAt(0).toUpperCase() + fieldName.slice(1)} updated successfully!`,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('✏️ Edit Another Field', 'back_to_menu')],
+                    [Markup.button.callback('🏠 Main Menu', 'goto_main_menu')]
+                ])
+            );
+        }
+        
+        ctx.session.editField = null;
+        
+    } catch (error) {
+        console.error(`Error updating ${field}:`, error);
+        await ctx.reply(`❌ Error updating ${field}. Please try again.`);
+    }
+}
+
 const stage = new Scenes.Stage([profileSetupScene, editProfileScene]);
 bot.use(session());
 bot.use(stage.middleware());
@@ -1610,7 +1678,7 @@ bot.action('show_help', async (ctx) => {
 bot.action('create_profile', async (ctx) => {
     try {
         await ctx.answerCbQuery();
-        await ctx.scene.enter('profileSetup');
+        await ctx.scene.enter('PROFILE_SETUP');
     } catch (error) {
         console.error('Error in create_profile action:', error);
         await ctx.answerCbQuery('❌ An error occurred. Please try again.');
@@ -1943,7 +2011,7 @@ bot.hears('✏️ Edit Profile', async (ctx) => {
 
 bot.hears('🚀 Create Profile', async (ctx) => {
     try {
-        await ctx.scene.enter('profileSetup');
+        await ctx.scene.enter('PROFILE_SETUP');
     } catch (error) {
         console.error('Error in create profile:', error);
         await ctx.reply('❌ An error occurred. Please try again.');
@@ -2090,6 +2158,822 @@ bot.hears('📊 Menu', async (ctx) => {
     } catch (error) {
         console.error('Error in menu:', error);
         await ctx.reply('❌ An error occurred. Please try again.', createMainMenuKeyboard());
+    }
+});
+
+// Admin Commands (must be before message handlers)
+function isAdmin(userId) {
+    return ADMIN_CHAT_ID && userId.toString() === ADMIN_CHAT_ID.toString();
+}
+
+// List all users command
+bot.command('listusers', async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from.id)) {
+            await ctx.reply('❌ Access denied. Admin only.');
+            return;
+        }
+
+        console.log(`[ADMIN] ${ctx.from.id} requested user list`);
+
+        let users = [];
+        if (db) {
+            users = await db.collection('users').find({}).sort({ createdAt: -1 }).toArray();
+        } else if (redisClient) {
+            const keys = await redisClient.keys('user:*');
+            for (const key of keys) {
+                const userData = await redisClient.get(key);
+                if (userData) users.push(JSON.parse(userData));
+            }
+        } else {
+            users = Array.from(memoryUsers.values());
+        }
+
+        if (users.length === 0) {
+            await ctx.reply('📊 **User List**\n\n❌ No users found.');
+            return;
+        }
+
+        // Split users into chunks of 10 for readability
+        const chunkSize = 10;
+        for (let i = 0; i < users.length; i += chunkSize) {
+            const chunk = users.slice(i, i + chunkSize);
+            
+            let userList = `📊 **User List** (${i + 1}-${Math.min(i + chunkSize, users.length)} of ${users.length})\n\n`;
+            
+            chunk.forEach((user, index) => {
+                const status = user.isBanned ? '🚫 BANNED' : (user.isActive ? '✅ Active' : '⏸️ Inactive');
+                const joinDate = new Date(user.createdAt).toLocaleDateString();
+                
+                userList += `**${i + index + 1}.** ${user.firstName || 'Unknown'}\n`;
+                userList += `   👤 ID: \`${user.userId}\`\n`;
+                userList += `   📱 Username: ${user.username ? '@' + user.username : 'None'}\n`;
+                userList += `   🎂 Age: ${user.age} | ${user.gender}\n`;
+                userList += `   📅 Joined: ${joinDate}\n`;
+                userList += `   ${status}\n\n`;
+            });
+
+            await ctx.reply(userList, { parse_mode: 'Markdown' });
+            
+            // Add small delay between chunks to avoid flooding
+            if (i + chunkSize < users.length) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        }
+
+        await ctx.reply(
+            `📋 **Usage Instructions:**\n\n` +
+            `• Copy user ID from list above\n` +
+            `• Ban user: \`/ban USER_ID reason\`\n` +
+            `• Unban user: \`/unban USER_ID\`\n` +
+            `• View user details: \`/user USER_ID\`\n\n` +
+            `💡 **Quick Commands:**\n` +
+            `• \`/listbanned\` - Show banned users\n` +
+            `• \`/stats\` - Bot statistics\n` +
+            `• \`/broadcast\` - Send message to all users`,
+            { parse_mode: 'Markdown' }
+        );
+
+    } catch (error) {
+        console.error('Error in listusers command:', error);
+        await ctx.reply('❌ An error occurred while fetching user list.');
+    }
+});
+
+// List banned users command
+bot.command('listbanned', async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from.id)) {
+            await ctx.reply('❌ Access denied. Admin only.');
+            return;
+        }
+
+        console.log(`[ADMIN] ${ctx.from.id} requested banned users list`);
+
+        let bannedUsers = [];
+        if (db) {
+            bannedUsers = await db.collection('users').find({ isBanned: true }).sort({ createdAt: -1 }).toArray();
+        } else if (redisClient) {
+            const keys = await redisClient.keys('user:*');
+            for (const key of keys) {
+                const userData = await redisClient.get(key);
+                if (userData) {
+                    const user = JSON.parse(userData);
+                    if (user.isBanned) bannedUsers.push(user);
+                }
+            }
+        } else {
+            bannedUsers = Array.from(memoryUsers.values()).filter(user => user.isBanned);
+        }
+
+        if (bannedUsers.length === 0) {
+            await ctx.reply('🚫 **Banned Users**\n\n✅ No banned users found.');
+            return;
+        }
+
+        let bannedList = `🚫 **Banned Users** (${bannedUsers.length} total)\n\n`;
+        
+        bannedUsers.forEach((user, index) => {
+            const bannedDate = user.bannedAt ? new Date(user.bannedAt).toLocaleDateString() : 'Unknown';
+            
+            bannedList += `**${index + 1}.** ${user.firstName || 'Unknown'}\n`;
+            bannedList += `   👤 ID: \`${user.userId}\`\n`;
+            bannedList += `   📱 Username: ${user.username ? '@' + user.username : 'None'}\n`;
+            bannedList += `   🎂 Age: ${user.age} | ${user.gender}\n`;
+            bannedList += `   🚫 Banned: ${bannedDate}\n`;
+            if (user.banReason) {
+                bannedList += `   📝 Reason: ${user.banReason}\n`;
+            }
+            bannedList += `\n`;
+        });
+
+        await ctx.reply(bannedList, { parse_mode: 'Markdown' });
+
+        await ctx.reply(
+            `🔧 **Unban Instructions:**\n\n` +
+            `• Copy user ID from list above\n` +
+            `• Unban: \`/unban USER_ID\`\n\n` +
+            `💡 Example: \`/unban 123456789\``,
+            { parse_mode: 'Markdown' }
+        );
+
+    } catch (error) {
+        console.error('Error in listbanned command:', error);
+        await ctx.reply('❌ An error occurred while fetching banned users list.');
+    }
+});
+
+// Enhanced admin command with user management menu
+bot.command('admin', async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from.id)) {
+            await ctx.reply('❌ Access denied. Admin only.');
+            return;
+        }
+
+        const adminMenu = 
+            '👨‍💼 **Admin Panel**\n\n' +
+            '**👥 User Management:**\n' +
+            '• `/listusers` - List all users with IDs\n' +
+            '• `/listbanned` - List banned users\n' +
+            '• `/appeals` - List pending appeals\n' +
+            '• `/user USER_ID` - View user details\n' +
+            '• `/ban USER_ID reason` - Ban a user\n' +
+            '• `/unban USER_ID` - Unban a user\n\n' +
+            '**⚖️ Appeal Management:**\n' +
+            '• `/approve USER_ID` - Approve ban appeal\n' +
+            '• `/deny USER_ID reason` - Deny ban appeal\n\n' +
+            '**📊 Statistics:**\n' +
+            '• `/stats` - Bot statistics\n\n' +
+            '**📢 Communication:**\n' +
+            '• `/broadcast message` - Send to all users\n\n' +
+            '💡 **Pro Tips:**\n' +
+            '• Use `/listusers` to see user IDs\n' +
+            '• Check `/appeals` for pending reviews\n' +
+            '• Copy-paste IDs for quick actions';
+
+        await ctx.reply(adminMenu, { parse_mode: 'Markdown' });
+
+    } catch (error) {
+        console.error('Error in admin command:', error);
+        await ctx.reply('❌ An error occurred.');
+    }
+});
+
+// Enhanced user details command
+bot.command('user', async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from.id)) {
+            await ctx.reply('❌ Access denied. Admin only.');
+            return;
+        }
+
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            await ctx.reply('❌ Usage: `/user USER_ID`\n\n💡 Get user IDs from `/listusers`');
+            return;
+        }
+
+        const targetUserId = parseInt(args[1]);
+        if (isNaN(targetUserId)) {
+            await ctx.reply('❌ Invalid user ID. Must be a number.');
+            return;
+        }
+
+        const user = await DatabaseOperations.getUser(targetUserId);
+        if (!user) {
+            await ctx.reply(`❌ User ${targetUserId} not found.`);
+            return;
+        }
+
+        // Check if user is in active match
+        const activeMatch = await DatabaseOperations.getActiveMatch(targetUserId);
+        
+        const userDetails = 
+            `👤 **User Details**\n\n` +
+            `**Basic Info:**\n` +
+            `• Name: ${user.firstName}\n` +
+            `• ID: \`${user.userId}\`\n` +
+            `• Username: ${user.username ? '@' + user.username : 'None'}\n` +
+            `• Age: ${user.age}\n` +
+            `• Gender: ${user.gender}\n` +
+            `• Education: ${user.education}\n` +
+            `• Languages: ${Array.isArray(user.language) ? user.language.join(', ') : user.language}\n\n` +
+            `**Preferences:**\n` +
+            `• Looking for: ${user.preferredGender}\n` +
+            `• Interests: ${user.interests.join(', ')}\n\n` +
+            `**Status:**\n` +
+            `• Account: ${user.isBanned ? '🚫 Banned' : '✅ Active'}\n` +
+            `• Currently: ${activeMatch ? '💬 In chat' : '🏠 Available'}\n` +
+            `• Joined: ${new Date(user.createdAt).toLocaleDateString()}\n` +
+            `• Last active: ${new Date(user.lastActive).toLocaleDateString()}\n\n` +
+            `**Actions:**\n` +
+            `• Ban: \`/ban ${user.userId} reason\`\n` +
+            `• ${user.isBanned ? 'Unban: `/unban ' + user.userId + '`' : 'User is not banned'}`;
+
+        await ctx.reply(userDetails, { parse_mode: 'Markdown' });
+
+    } catch (error) {
+        console.error('Error in user command:', error);
+        await ctx.reply('❌ An error occurred while fetching user details.');
+    }
+});
+
+// Enhanced ban command with reason tracking
+bot.command('ban', async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from.id)) {
+            await ctx.reply('❌ Access denied. Admin only.');
+            return;
+        }
+
+        const args = ctx.message.text.split(' ');
+        if (args.length < 3) {
+            await ctx.reply(
+                '❌ Usage: `/ban USER_ID reason`\n\n' +
+                '💡 Examples:\n' +
+                '• `/ban 123456789 inappropriate behavior`\n' +
+                '• `/ban 987654321 spam messages`\n\n' +
+                '📋 Get user IDs from `/listusers`'
+            );
+            return;
+        }
+
+        const targetUserId = parseInt(args[1]);
+        const reason = args.slice(2).join(' ');
+
+        if (isNaN(targetUserId)) {
+            await ctx.reply('❌ Invalid user ID. Must be a number.');
+            return;
+        }
+
+        const user = await DatabaseOperations.getUser(targetUserId);
+        if (!user) {
+            await ctx.reply(`❌ User ${targetUserId} not found.`);
+            return;
+        }
+
+        if (user.isBanned) {
+            await ctx.reply(`⚠️ User ${user.firstName} (${targetUserId}) is already banned.`);
+            return;
+        }
+
+        // Update user ban status
+        const updatedProfile = {
+            ...user,
+            isBanned: true,
+            bannedAt: new Date(),
+            banReason: reason,
+            bannedBy: ctx.from.id
+        };
+
+        await DatabaseOperations.saveUser(updatedProfile);
+
+        // End any active matches
+        const activeMatch = await DatabaseOperations.getActiveMatch(targetUserId);
+        if (activeMatch) {
+            await DatabaseOperations.endMatch(activeMatch.id);
+        }
+
+        console.log(`[ADMIN] User ${targetUserId} banned by ${ctx.from.id}. Reason: ${reason}`);
+
+        await ctx.reply(
+            `✅ **User Banned Successfully**\n\n` +
+            `👤 User: ${user.firstName} (${targetUserId})\n` +
+            `📝 Reason: ${reason}\n` +
+            `🕐 Time: ${new Date().toLocaleString()}\n\n` +
+            `💡 To unban: \`/unban ${targetUserId}\``,
+            { parse_mode: 'Markdown' }
+        );
+
+        // Notify the banned user
+        try {
+            await bot.telegram.sendMessage(
+                targetUserId,
+                `🚫 **Account Suspended**\n\n` +
+                `Your account has been suspended by an administrator.\n\n` +
+                `📝 Reason: ${reason}\n\n` +
+                `📞 Contact support if you believe this is an error.`,
+                { parse_mode: 'Markdown' }
+            );
+        } catch (notifyError) {
+            console.log(`Could not notify banned user ${targetUserId}:`, notifyError.message);
+        }
+
+    } catch (error) {
+        console.error('Error in ban command:', error);
+        await ctx.reply('❌ An error occurred while banning user.');
+    }
+});
+
+// Enhanced unban command
+bot.command('unban', async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from.id)) {
+            await ctx.reply('❌ Access denied. Admin only.');
+            return;
+        }
+
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            await ctx.reply(
+                '❌ Usage: `/unban USER_ID`\n\n' +
+                '💡 Examples:\n' +
+                '• `/unban 123456789`\n\n' +
+                '📋 Get banned user IDs from `/listbanned`'
+            );
+            return;
+        }
+
+        const targetUserId = parseInt(args[1]);
+        if (isNaN(targetUserId)) {
+            await ctx.reply('❌ Invalid user ID. Must be a number.');
+            return;
+        }
+
+        const user = await DatabaseOperations.getUser(targetUserId);
+        if (!user) {
+            await ctx.reply(`❌ User ${targetUserId} not found.`);
+            return;
+        }
+
+        if (!user.isBanned) {
+            await ctx.reply(`⚠️ User ${user.firstName} (${targetUserId}) is not banned.`);
+            return;
+        }
+
+        // Update user unban status
+        const updatedProfile = {
+            ...user,
+            isBanned: false,
+            unbannedAt: new Date(),
+            unbannedBy: ctx.from.id,
+            // Keep ban history
+            lastBanReason: user.banReason,
+            lastBannedAt: user.bannedAt
+        };
+
+        // Remove current ban fields
+        delete updatedProfile.banReason;
+        delete updatedProfile.bannedAt;
+        delete updatedProfile.bannedBy;
+
+        await DatabaseOperations.saveUser(updatedProfile);
+
+        console.log(`[ADMIN] User ${targetUserId} unbanned by ${ctx.from.id}`);
+
+        await ctx.reply(
+            `✅ **User Unbanned Successfully**\n\n` +
+            `👤 User: ${user.firstName} (${targetUserId})\n` +
+            `🕐 Time: ${new Date().toLocaleString()}\n\n` +
+            `💡 User can now use the bot normally.`,
+            { parse_mode: 'Markdown' }
+        );
+
+        // Notify the unbanned user
+        try {
+            await bot.telegram.sendMessage(
+                targetUserId,
+                `✅ **Account Restored**\n\n` +
+                `Your account has been restored by an administrator.\n\n` +
+                `🎉 You can now use the bot normally!\n` +
+                `💡 Use /start to begin.`,
+                { parse_mode: 'Markdown' }
+            );
+        } catch (notifyError) {
+            console.log(`Could not notify unbanned user ${targetUserId}:`, notifyError.message);
+        }
+
+    } catch (error) {
+        console.error('Error in unban command:', error);
+        await ctx.reply('❌ An error occurred while unbanning user.');
+    }
+});
+
+// Enhanced stats command
+bot.command('stats', async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from.id)) {
+            await ctx.reply('❌ Access denied. Admin only.');
+            return;
+        }
+
+        let totalUsers = 0;
+        let activeUsers = 0;
+        let bannedUsers = 0;
+        let totalMatches = 0;
+        let activeMatches = 0;
+
+        if (db) {
+            totalUsers = await db.collection('users').countDocuments();
+            activeUsers = await db.collection('users').countDocuments({ isBanned: false });
+            bannedUsers = await db.collection('users').countDocuments({ isBanned: true });
+            totalMatches = await db.collection('matches').countDocuments();
+            activeMatches = await db.collection('matches').countDocuments({ isActive: true });
+        } else if (redisClient) {
+            const userKeys = await redisClient.keys('user:*');
+            totalUsers = userKeys.length;
+            for (const key of userKeys) {
+                const userData = await redisClient.get(key);
+                if (userData) {
+                    const user = JSON.parse(userData);
+                    if (user.isBanned) bannedUsers++;
+                    else activeUsers++;
+                }
+            }
+            const matchKeys = await redisClient.keys('match:*');
+            totalMatches = matchKeys.length;
+            for (const key of matchKeys) {
+                const matchData = await redisClient.get(key);
+                if (matchData) {
+                    const match = JSON.parse(matchData);
+                    if (match.isActive) activeMatches++;
+                }
+            }
+        } else {
+            totalUsers = memoryUsers.size;
+            Array.from(memoryUsers.values()).forEach(user => {
+                if (user.isBanned) bannedUsers++;
+                else activeUsers++;
+            });
+            totalMatches = memoryMatches.size;
+            Array.from(memoryMatches.values()).forEach(match => {
+                if (match && match.isActive) activeMatches++;
+            });
+        }
+
+        const stats = 
+            `📊 **Bot Statistics**\n\n` +
+            `**👥 Users:**\n` +
+            `• Total Users: ${totalUsers}\n` +
+            `• Active Users: ${activeUsers}\n` +
+            `• Banned Users: ${bannedUsers}\n\n` +
+            `**💬 Matches:**\n` +
+            `• Total Matches: ${totalMatches}\n` +
+            `• Active Chats: ${activeMatches}\n\n` +
+            `**🏥 System:**\n` +
+            `• Database: ${db ? 'MongoDB' : redisClient ? 'Redis' : 'Memory'}\n` +
+            `• Uptime: ${process.uptime().toFixed(0)}s\n` +
+            `• Memory: ${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB\n\n` +
+            `📅 Generated: ${new Date().toLocaleString()}`;
+
+        await ctx.reply(stats, { parse_mode: 'Markdown' });
+
+    } catch (error) {
+        console.error('Error in stats command:', error);
+        await ctx.reply('❌ An error occurred while fetching statistics.');
+    }
+});
+
+// Enhanced broadcast command
+bot.command('broadcast', async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from.id)) {
+            await ctx.reply('❌ Access denied. Admin only.');
+            return;
+        }
+
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            await ctx.reply(
+                '❌ Usage: `/broadcast message`\n\n' +
+                '💡 Example:\n' +
+                '`/broadcast 🎉 Bot maintenance completed! New features added.`\n\n' +
+                '⚠️ This will send the message to ALL users!'
+            );
+            return;
+        }
+
+        const message = args.slice(1).join(' ');
+        
+        let users = [];
+        if (db) {
+            users = await db.collection('users').find({ isBanned: false }).toArray();
+        } else if (redisClient) {
+            const keys = await redisClient.keys('user:*');
+            for (const key of keys) {
+                const userData = await redisClient.get(key);
+                if (userData) {
+                    const user = JSON.parse(userData);
+                    if (!user.isBanned) users.push(user);
+                }
+            }
+        } else {
+            users = Array.from(memoryUsers.values()).filter(user => !user.isBanned);
+        }
+
+        if (users.length === 0) {
+            await ctx.reply('❌ No active users found to broadcast to.');
+            return;
+        }
+
+        await ctx.reply(
+            `📢 **Broadcasting Message**\n\n` +
+            `👥 Target: ${users.length} active users\n` +
+            `📝 Message: ${message}\n\n` +
+            `⏳ Starting broadcast...`
+        );
+
+        let sent = 0;
+        let failed = 0;
+
+        for (const user of users) {
+            try {
+                await bot.telegram.sendMessage(
+                    user.userId,
+                    `📢 **Admin Message**\n\n${message}`,
+                    { parse_mode: 'Markdown' }
+                );
+                sent++;
+                
+                // Add small delay to avoid rate limiting
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+            } catch (error) {
+                failed++;
+                console.log(`Failed to send broadcast to ${user.userId}:`, error.message);
+            }
+        }
+
+        await ctx.reply(
+            `✅ **Broadcast Complete**\n\n` +
+            `📤 Sent: ${sent}\n` +
+            `❌ Failed: ${failed}\n` +
+            `👥 Total: ${users.length}\n\n` +
+            `📅 Completed: ${new Date().toLocaleString()}`
+        );
+
+        console.log(`[ADMIN] Broadcast sent by ${ctx.from.id}. Sent: ${sent}, Failed: ${failed}`);
+
+    } catch (error) {
+        console.error('Error in broadcast command:', error);
+        await ctx.reply('❌ An error occurred while broadcasting message.');
+    }
+});
+
+// Admin Appeal Management Commands
+bot.command('appeals', async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from.id)) {
+            await ctx.reply('❌ Access denied. Admin only.');
+            return;
+        }
+
+        let appeals = [];
+        if (db) {
+            appeals = await db.collection('users').find({ 
+                isBanned: true, 
+                appealStatus: { $exists: true } 
+            }).sort({ appealedAt: -1 }).toArray();
+        } else if (redisClient) {
+            const keys = await redisClient.keys('user:*');
+            for (const key of keys) {
+                const userData = await redisClient.get(key);
+                if (userData) {
+                    const user = JSON.parse(userData);
+                    if (user.isBanned && user.appealStatus) appeals.push(user);
+                }
+            }
+        } else {
+            appeals = Array.from(memoryUsers.values()).filter(user => 
+                user.isBanned && user.appealStatus
+            );
+        }
+
+        if (appeals.length === 0) {
+            await ctx.reply('📋 **Appeals List**\n\n❌ No appeals found.');
+            return;
+        }
+
+        const pendingAppeals = appeals.filter(user => user.appealStatus === 'pending');
+        
+        let message = `📋 **Appeals Overview**\n\n📊 Total: ${appeals.length} | ⏳ Pending: ${pendingAppeals.length}\n\n`;
+        
+        if (pendingAppeals.length > 0) {
+            message += `⏳ **PENDING APPEALS**\n\n`;
+            pendingAppeals.slice(0, 3).forEach((user, index) => {
+                message += `**${index + 1}.** ${user.firstName} (\`${user.userId}\`)\n`;
+                message += `   💬 "${user.appealText.substring(0, 80)}..."\n`;
+                message += `   📅 ${new Date(user.appealedAt).toLocaleDateString()}\n\n`;
+            });
+        }
+
+        await ctx.reply(message, { parse_mode: 'Markdown' });
+
+    } catch (error) {
+        console.error('Error in appeals command:', error);
+        await ctx.reply('❌ An error occurred while fetching appeals.');
+    }
+});
+
+bot.command('approve', async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from.id)) {
+            await ctx.reply('❌ Access denied. Admin only.');
+            return;
+        }
+
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            await ctx.reply('❌ Usage: `/approve USER_ID`\n💡 Get user IDs from `/appeals`');
+            return;
+        }
+
+        const targetUserId = parseInt(args[1]);
+        const user = await DatabaseOperations.getUser(targetUserId);
+        
+        if (!user || !user.isBanned || user.appealStatus !== 'pending') {
+            await ctx.reply('❌ User not found or no pending appeal.');
+            return;
+        }
+
+        const updatedProfile = {
+            ...user,
+            isBanned: false,
+            appealStatus: 'approved',
+            appealReviewedBy: ctx.from.id,
+            appealReviewedAt: new Date(),
+            unbannedAt: new Date(),
+            unbannedBy: ctx.from.id
+        };
+
+        await DatabaseOperations.saveUser(updatedProfile);
+
+        await ctx.reply(
+            `✅ **Appeal Approved**\n\n👤 User: ${user.firstName} (${targetUserId})\n💬 Appeal: "${user.appealText}"\n✅ Account restored`,
+            { parse_mode: 'Markdown' }
+        );
+
+        try {
+            await bot.telegram.sendMessage(
+                targetUserId,
+                `✅ **Appeal Approved!**\n\n🎉 Your ban appeal has been approved!\n💬 Your appeal: "${user.appealText}"\n\n🎊 Welcome back! Use /start to begin.`,
+                { parse_mode: 'Markdown' }
+            );
+        } catch (error) {
+            console.log(`Could not notify user ${targetUserId}:`, error.message);
+        }
+
+    } catch (error) {
+        console.error('Error in approve command:', error);
+        await ctx.reply('❌ An error occurred while approving appeal.');
+    }
+});
+
+bot.command('deny', async (ctx) => {
+    try {
+        if (!isAdmin(ctx.from.id)) {
+            await ctx.reply('❌ Access denied. Admin only.');
+            return;
+        }
+
+        const args = ctx.message.text.split(' ');
+        if (args.length < 3) {
+            await ctx.reply('❌ Usage: `/deny USER_ID reason`\n💡 Example: `/deny 123456789 Insufficient justification`');
+            return;
+        }
+
+        const targetUserId = parseInt(args[1]);
+        const denyReason = args.slice(2).join(' ');
+        const user = await DatabaseOperations.getUser(targetUserId);
+        
+        if (!user || !user.isBanned || user.appealStatus !== 'pending') {
+            await ctx.reply('❌ User not found or no pending appeal.');
+            return;
+        }
+
+        const updatedProfile = {
+            ...user,
+            appealStatus: 'denied',
+            appealReviewedBy: ctx.from.id,
+            appealReviewedAt: new Date(),
+            appealDenyReason: denyReason
+        };
+
+        await DatabaseOperations.saveUser(updatedProfile);
+
+        await ctx.reply(
+            `❌ **Appeal Denied**\n\n👤 User: ${user.firstName} (${targetUserId})\n💬 Appeal: "${user.appealText}"\n❌ Reason: ${denyReason}`,
+            { parse_mode: 'Markdown' }
+        );
+
+        try {
+            await bot.telegram.sendMessage(
+                targetUserId,
+                `❌ **Appeal Denied**\n\n😔 Your ban appeal has been denied.\n💬 Your appeal: "${user.appealText}"\n❌ Reason: ${denyReason}\n\n🔄 You can submit a new appeal after 7 days.`,
+                { parse_mode: 'Markdown' }
+            );
+        } catch (error) {
+            console.log(`Could not notify user ${targetUserId}:`, error.message);
+        }
+
+    } catch (error) {
+        console.error('Error in deny command:', error);
+        await ctx.reply('❌ An error occurred while denying appeal.');
+    }
+});
+
+// Appeal System Commands
+bot.command('appeal', async (ctx) => {
+    try {
+        const user = await DatabaseOperations.getUser(ctx.from.id);
+        if (!user) {
+            await ctx.reply('❌ You need to create a profile first. Use /start to begin!');
+            return;
+        }
+
+        if (!user.isBanned) {
+            await ctx.reply('❌ Your account is not banned. You don\'t need to appeal.');
+            return;
+        }
+
+        if (user.appealStatus === 'pending') {
+            await ctx.reply(
+                '⏳ **Appeal Already Submitted**\n\n' +
+                'You already have a pending appeal. Please wait for admin review.\n\n' +
+                `📝 Your appeal: "${user.appealText}"\n` +
+                `📅 Submitted: ${new Date(user.appealedAt).toLocaleString()}`
+            );
+            return;
+        }
+
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            await ctx.reply(
+                '📝 **Submit Ban Appeal**\n\n' +
+                '❌ Usage: `/appeal your reason here`\n\n' +
+                '💡 Example:\n' +
+                '`/appeal I was banned by mistake. I was not spamming.`\n\n' +
+                '📋 **Tips:**\n' +
+                '• Be honest and respectful\n' +
+                '• Explain what happened\n' +
+                '• Keep it concise but detailed'
+            );
+            return;
+        }
+
+        const appealText = args.slice(1).join(' ');
+        
+        if (appealText.length < 10) {
+            await ctx.reply('❌ Your appeal is too short. Please provide more details.');
+            return;
+        }
+
+        const updatedProfile = {
+            ...user,
+            appealText: appealText,
+            appealedAt: new Date(),
+            appealStatus: 'pending'
+        };
+
+        await DatabaseOperations.saveUser(updatedProfile);
+
+        await ctx.reply(
+            '✅ **Appeal Submitted Successfully**\n\n' +
+            '📝 Your appeal has been sent to admins for review.\n\n' +
+            `📋 Appeal: "${appealText}"\n` +
+            `📅 Submitted: ${new Date().toLocaleString()}\n\n` +
+            '⏳ You\'ll be notified of the decision within 24-48 hours.'
+        );
+
+        if (ADMIN_CHAT_ID) {
+            try {
+                await bot.telegram.sendMessage(
+                    ADMIN_CHAT_ID,
+                    `🔔 **New Ban Appeal**\n\n` +
+                    `👤 User: ${user.firstName} (${user.userId})\n` +
+                    `💬 Appeal: "${appealText}"\n\n` +
+                    `⚡ Actions: \`/approve ${user.userId}\` or \`/deny ${user.userId} reason\``,
+                    { parse_mode: 'Markdown' }
+                );
+            } catch (error) {
+                console.log('Could not notify admin:', error.message);
+            }
+        }
+
+    } catch (error) {
+        console.error('Error in appeal command:', error);
+        await ctx.reply('❌ An error occurred while submitting your appeal.');
     }
 });
 
