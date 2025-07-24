@@ -153,6 +153,40 @@ async function initDatabase() {
 
 // Database operations
 class DatabaseOperations {
+    // Track all users who ever started the bot
+    static async addToAllUsers(userId) {
+        try {
+            if (db) {
+                await db.collection('all_users').updateOne(
+                    { userId },
+                    { $set: { userId } },
+                    { upsert: true }
+                );
+            } else if (redisClient) {
+                await redisClient.sAdd('all_users', userId.toString());
+            } else {
+                if (!global._allUsersSet) global._allUsersSet = new Set();
+                global._allUsersSet.add(userId);
+            }
+        } catch (error) {
+            console.error('Error adding to all_users:', error);
+        }
+    }
+
+    static async getAllUserCount() {
+        try {
+            if (db) {
+                return await db.collection('all_users').countDocuments();
+            } else if (redisClient) {
+                return await redisClient.sCard('all_users');
+            } else {
+                return global._allUsersSet ? global._allUsersSet.size : 0;
+            }
+        } catch (error) {
+            console.error('Error getting all user count:', error);
+            return 0;
+        }
+    }
     // User operations
     static async saveUser(userProfile) {
         try {
@@ -946,7 +980,7 @@ profileSetupScene.on('text', async (ctx) => {
             if (LANGUAGES.includes(text)) {
                 profileData.language = text;
                 await ctx.reply('🎯 Great! Now select your interests (choose multiple):', 
-                    this.createInterestsKeyboard(profileData.interests || [])
+                    createInterestsKeyboard(profileData.interests || [])
                 );
             } else {
                 await ctx.reply('❌ Please select a valid language from the keyboard above.');
@@ -1024,7 +1058,7 @@ profileSetupScene.action('languages_done', async (ctx) => {
     }
     
     await ctx.editMessageText('🎯 Great! Now select your interests (choose multiple):', 
-        this.createInterestsKeyboard(profileData.interests || [])
+        createInterestsKeyboard(profileData.interests || [])
     );
 });
 
@@ -1500,7 +1534,30 @@ bot.use(session());
 bot.use(stage.middleware());
 
 // Commands
+// Global error handler for all bot errors
+bot.catch(async (err, ctx) => {
+    // Handle Telegram 403 Forbidden (bot blocked by user)
+    if (err && err.response && err.response.error_code === 403 &&
+        err.response.description && err.response.description.includes('bot was blocked by the user')) {
+        console.warn(`User ${ctx.from?.id} blocked the bot. Cannot send messages.`);
+        return; // Do not attempt to reply
+    }
+    // Handle other Telegram 403 errors (e.g., user deleted account)
+    if (err && err.response && err.response.error_code === 403) {
+        console.warn(`Telegram 403 error for user ${ctx.from?.id}: ${err.response.description}`);
+        return;
+    }
+    // Log all other errors and try to reply (if possible)
+    console.error('Global bot error:', err);
+    try {
+        await ctx.reply('❌ An unexpected error occurred. Please try again later.');
+    } catch (e) {
+        // Ignore further errors (e.g., user blocked the bot)
+    }
+});
 bot.start(async (ctx) => {
+    // Track all users who ever started the bot
+    await DatabaseOperations.addToAllUsers(ctx.from.id);
     const existingUser = await DatabaseOperations.getUser(ctx.from.id);
     if (existingUser) {
         await ctx.reply(
@@ -2162,6 +2219,19 @@ bot.hears('📊 Menu', async (ctx) => {
 });
 
 // Admin Commands (must be before message handlers)
+// Admin totalUser command
+bot.command('totalUser', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) {
+        await ctx.reply('❌ Access denied. Admin only.');
+        return;
+    }
+    try {
+        const count = await DatabaseOperations.getAllUserCount();
+        await ctx.reply(`👥 Total users who ever joined: ${count}`);
+    } catch (error) {
+        await ctx.reply('❌ Failed to get total user count.');
+    }
+});
 function isAdmin(userId) {
     return ADMIN_CHAT_ID && userId.toString() === ADMIN_CHAT_ID.toString();
 }
